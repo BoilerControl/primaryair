@@ -1,0 +1,83 @@
+module BoilerControl(
+    input clk,          // 时钟信号
+    input [5:0] coal_rates, // 6个磨煤机的给煤率
+    input [5:0] mills_running, // 6个磨煤机的运行状态，1表示运行，0表示停止
+    input [5:0] hot_air_gate_openings, // 6个热风门开度
+    input [5:0] hot_air_gate_modes, // 6个热风门的手动/自动状态，1表示自动，0表示手动
+    input [5:0] primary_air_fan_modes, // 6个一次风机的手动/自动状态，1表示自动，0表示手动
+    output reg [3:0] hot_air_gate_opening, // 4位热风门开度信号
+    output reg [1:0] primary_air_fan_opening // 2位一次风机开度信号
+);
+
+    // 获取六台磨煤机的给煤率，并进行取大计算，获取最大的给煤率
+    wire [5:0] max_coal_rate;
+    assign max_coal_rate = coal_rates > coal_rates ? coal_rates : coal_rates;
+    
+    // 负荷发生函数器F1(x)，输出一次风炉压设定值为一次风压的基本设定值SV
+    wire [5:0] boiler_pressure_setpoint;
+    F1 load_generator(max_coal_rate, boiler_pressure_setpoint);
+
+    // 判断6台磨煤机中有几台处于运行状态，处于运行状态的磨煤机的热风门是否在自动状态
+    wire [5:0] running_mills;
+    wire [5:0] auto_hot_air_gates;
+    RunningMillsDetector running_mills_detector(
+        .mills_running(mills_running),
+        .hot_air_gate_modes(hot_air_gate_modes),
+        .running_mills(running_mills),
+        .auto_hot_air_gates(auto_hot_air_gates)
+    );
+
+    // 判断2台一次风机是否在自动状态
+    wire [1:0] auto_primary_air_fans;
+    PrimaryAirFanStatusDetector primary_air_fan_status_detector(
+        .primary_air_fan_modes(primary_air_fan_modes),
+        .auto_primary_air_fans(auto_primary_air_fans)
+    );
+
+    // 进入M/A站，若在AUTO状态，一次风自适应控制模块启动并开始计算
+    reg ma_station;
+    always @(posedge clk) begin
+        if (auto_hot_air_gates & auto_primary_air_fans)
+            ma_station <= 1'b1;
+        else
+            ma_station <= 1'b0;
+    end
+
+    // 一次风自适应控制模块根据各运行磨煤机的热风门开度需求，以及运行磨煤机对一次风量的实际需求进行自适当调整
+    reg [3:0] primary_air_fan_opening_adjusted;
+    PrimaryAirAdaptiveControl primary_air_adaptive_control(
+        .clk(clk),
+        .running_mills(running_mills),
+        .hot_air_gate_openings(hot_air_gate_openings),
+        .primary_air_fan_opening(primary_air_fan_opening_adjusted)
+    );
+
+    // 一次风自适应控制模块的输出值进入上下限幅块（下限值为-2.0kPa，上限值为0.5kPa），输出一次风压修正值
+    wire [3:0] primary_air_fan_opening_limited;
+    LimitingBlock limiting_block(
+        .input_value(primary_air_fan_opening_adjusted),
+        .output_value(primary_air_fan_opening_limited)
+    );
+
+    // 原一次风炉压设定值由6台磨煤机的最大给煤率经函数发生器生成，一次风压修正值与原一次风炉压设定值相加，得到一新的一次风压设定值
+    wire [3:0] new_boiler_pressure_setpoint;
+    SummationUnit summation_unit(
+        .value1(boiler_pressure_setpoint),
+        .value2(primary_air_fan_opening_limited),
+        .sum(new_boiler_pressure_setpoint)
+    );
+
+    // 限制一次风压输出值（如10.0kPa~6.5kPa），由一次风控制输出单元中的一次风炉膛差压PID逻辑控制2台一次风机
+    reg [3:0] fan_pressure_output;
+    FanPressurePID fan_pressure_pid(
+        .input_pv(new_boiler_pressure_setpoint),
+        .output(fan_pressure_output)
+    );
+
+    // 将一次风压设定值输出到对应的热风门和一次风机
+    always @(posedge clk) begin
+        hot_air_gate_opening <= new_boiler_pressure_setpoint[3:0];
+        primary_air_fan_opening <= fan_pressure_output[1:0];
+    end
+
+endmodule
